@@ -22,8 +22,8 @@ def send_to_agent(command_str):
 
 #Le hook clavier bas niveau
 WH_KEYBOARD_LL = 13 #hook de type clavier bas niveau
-WM_KEYDOWN = 0x0100
-WM_SYSKEYDOWN = 0x0104
+LRESULT = ctypes.c_ssize_t
+WM_KEYDOWN, WM_SYSKEYDOWN = 0x0100, 0x0104
 VK_CAPITAL = 0x14
 VK_NUMLOCK = 0x90
 LLKHF_INJECTED = 0x10  # Indicateur d'evenement generer par programme
@@ -37,7 +37,7 @@ class KBDLLHOOKSTRUCT(ctypes.Structure):
         ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),]
 
 LowLevelKeyboardProc = ctypes.WINFUNCTYPE(
-    ctypes.c_int, ctypes.c_int, ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM)
+    LRESULT, ctypes.c_int, ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM)
 
 # Variables d'etat globales
 hook_id = None #identifiant que Windows nous donne une fois le hook installer
@@ -46,6 +46,7 @@ keyboard_disabled = False
 locked_maj = False
 locked_min = False
 remappings = {}  # vk_code source -> vk_code cible
+_hook_ready = threading.Event()
 
 def is_admin():
     try:
@@ -55,48 +56,65 @@ def is_admin():
 
 def _hook_proc(nCode, wParam, lParam):
     """Windows appelle cette fonction automatiquement a chaque touche pour decidesr quoi faire de chaque une"""
-    if nCode >= 0: #verifie quon a bien un vrai evenement a traiter
-        kbd = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
-        vk_code = kbd.vkCode #quelle touche a ete presser
-        is_injected = (kbd.flags & LLKHF_INJECTED) != 0 #est ce un vrai appui ou un faux
-        if keyboard_disabled: #Cas 1: tout bloquer
-            return 1
-        if (locked_maj or locked_min) and vk_code == VK_CAPITAL and not is_injected: #Cas 2: bloquer une touche precise (Verr. Maj)
-            return 1
-        if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN) and vk_code in remappings: # Cas 3 : remplacer une touche
-            target_vk = remappings[vk_code]
-            ctypes.windll.user32.keybd_event(target_vk, 0, 0, 0)
-            ctypes.windll.user32.keybd_event(target_vk, 0, 2, 0)
-            return 1
+    try:
+        if nCode >= 0:
+            kbd = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+            vk = kbd.vkCode
+            injected = (kbd.flags & LLKHF_INJECTED) != 0
+            if not injected:  # on ne touche jamais aux frappes générées par programme
+                if keyboard_disabled:
+                    return 1
+                if (locked_maj or locked_min) and vk == VK_CAPITAL:
+                    return 1
+                if vk in remappings:
+                    if wParam in (WM_KEYDOWN, WM_SYSKEYDOWN):
+                        target = remappings[vk]
+                        ctypes.windll.user32.keybd_event(target, 0, 0, 0)
+                        ctypes.windll.user32.keybd_event(target, 0, 2, 0)
+                    return 1  # avale keydown ET keyup de la touche d'origine
+    except Exception as e:
+        print(f"[-] Erreur dans le hook : {e}")
     return ctypes.windll.user32.CallNextHookEx(hook_id, nCode, wParam, lParam)
 
-def start_keyboard_hook():
-    """Installe le hook clavier global (appeler une seule fois, au demarrage de l'agent)"""
+def _hook_thread():
+    """Installe le hook ET pompe les messages dans le MEME thread."""
     global hook_id, _hook_ref
-    if hook_id:
-        return True  # deja installer
-    if not is_admin():
-        print("[-] ATTENTION : droits administrateur requis pour le hook clavier.")
-    _hook_ref = LowLevelKeyboardProc(_hook_proc) #transforme la fonction Python en quelque chose que Windows peut appeler directement
     user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+
+    kernel32.GetModuleHandleW.restype = ctypes.wintypes.HMODULE
+    kernel32.GetModuleHandleW.argtypes = [ctypes.wintypes.LPCWSTR]
     user32.SetWindowsHookExW.restype = ctypes.wintypes.HHOOK
     user32.SetWindowsHookExW.argtypes = [
         ctypes.c_int, LowLevelKeyboardProc, ctypes.wintypes.HINSTANCE, ctypes.wintypes.DWORD]
-    user32.CallNextHookEx.restype = ctypes.c_int
+    user32.CallNextHookEx.restype = LRESULT
     user32.CallNextHookEx.argtypes = [
         ctypes.wintypes.HHOOK, ctypes.c_int, ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM]
-    hook_id = user32.SetWindowsHookExW(WH_KEYBOARD_LL, _hook_ref, 0, 0)
+
+    _hook_ref = LowLevelKeyboardProc(_hook_proc)
+    hook_id = user32.SetWindowsHookExW(
+        WH_KEYBOARD_LL, _hook_ref, kernel32.GetModuleHandleW(None), 0)
+    _hook_ready.set()
+    if not hook_id:
+        return
+
+    msg = ctypes.wintypes.MSG()
+    while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+        user32.TranslateMessage(ctypes.byref(msg))
+        user32.DispatchMessageW(ctypes.byref(msg))
+
+def start_keyboard_hook():
+    global hook_id
+    if hook_id:
+        return True
+    if not is_admin():
+        print("[-] ATTENTION : droits administrateur requis pour le hook clavier.")
+    threading.Thread(target=_hook_thread, daemon=True).start()
+    _hook_ready.wait(3)
     if not hook_id:
         err = ctypes.windll.kernel32.GetLastError()
-        print(f"[-] Erreur : Impossible d'installer le hook clavier ! Code erreur Windows : {err}")
+        print(f"[-] Impossible d'installer le hook clavier ! Code erreur : {err}")
         return False
-    def pump_messages():
-        # Boucle de messages Windows requise pour que le hook recoive les evenements
-        msg = ctypes.wintypes.MSG()
-        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
-            user32.TranslateMessage(ctypes.byref(msg))
-            user32.DispatchMessageW(ctypes.byref(msg))
-    threading.Thread(target=pump_messages, daemon=True).start()
     print("[+] Hook clavier bas niveau actif.")
     return True
 
@@ -149,46 +167,6 @@ def reset_all():
     locked_min = False
     remappings.clear()
     return True
-
-def get_keyboards():
-    """Retourne la liste des peripheriques de categorie "Clavier" detecter par le backend"""
-    from device_scanner import scan_all
-    return [d for d in scan_all() if d.category == "Clavier"]
-
-def get_leds_state():
-    """Retourne une chaine lisible de l'etat courant des voyants Verr. Maj. et Verr. Num"""
-    user32 = ctypes.windll.user32
-    maj = "activé" if user32.GetKeyState(VK_CAPITAL) & 0x0001 else "désactivé"
-    num = "activé" if user32.GetKeyState(VK_NUMLOCK) & 0x0001 else "désactivé"
-    return f"Verr. Maj. : {maj}  |  Verr. Num. : {num}"
-
-def disable_keyboard_device(device_id):
-    """Desactive le clavier jusqu'a l'appel de enable_keyboard_device"""
-    if not set_keyboard_disabled(True):
-        return False, "Impossible d'installer le hook clavier (droits administrateur requis)."
-    return True, "Clavier désactivé. Cliquez sur \"Réactiver\" pour le restaurer."
-
-def enable_keyboard_device(device_id):
-    """Reactive le clavier et efface tout remappage/verrouillage en cours"""
-    reset_all()
-    return True, "Clavier réactivé."
-
-def remap_keyboard_key(src, dst):
-    """Remappe la touche `src` vers `dst` (reste actif jusqu'a reactivation)"""
-    return set_key_remap(src, dst)
-
-def blink_keyboard_leds():
-    """Fait clignoter le voyant Verr. Maj. trois fois pour tester les LED, puis restaure l'etat initial"""
-    user32 = ctypes.windll.user32
-    initial_on = bool(user32.GetKeyState(VK_CAPITAL) & 0x0001)
-    for _ in range(3):
-        user32.keybd_event(VK_CAPITAL, 0, 0, 0)
-        user32.keybd_event(VK_CAPITAL, 0, 2, 0)
-        time.sleep(0.3)
-    current_on = bool(user32.GetKeyState(VK_CAPITAL) & 0x0001)
-    if current_on != initial_on:
-        user32.keybd_event(VK_CAPITAL, 0, 0, 0)
-        user32.keybd_event(VK_CAPITAL, 0, 2, 0)
 
 def type_text_value(text):
     """Simule la frappe clavier dans la fenêtre active (ex: Bloc-notes)"""
