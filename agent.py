@@ -16,7 +16,7 @@ except ImportError:
 
 # Meme valeur que COMMAND_FILE dans keyboard_control.py : les deux fichiers
 # doivent imperativement pointer vers le meme command.txt (meme dossier).
-COMMAND_FILE = "command.txt"
+COMMAND_FILE = r"C:\keyboard_control\command.txt" 
 
 from keyboard_control import (
     is_admin,

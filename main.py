@@ -11,6 +11,7 @@ import sys
 import time
 from collections import Counter
 from itertools import groupby
+from host_launch import ensure_agent_running
 
 from device_scanner import scan_all, scan_system
 from device_info import get_details
@@ -205,6 +206,8 @@ def main_cli():
 def main():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
+    print("[*] Vérification de l'agent sur la VM...")
+    ensure_agent_running()
     if len(sys.argv) > 1:
         main_cli()
     else:

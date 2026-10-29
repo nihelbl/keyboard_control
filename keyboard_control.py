@@ -8,7 +8,7 @@ try:
 except ImportError:
     pyautogui = None
 
-COMMAND_FILE = "command.txt"
+COMMAND_FILE = r"C:\keyboard_control\command.txt"
 
 def send_to_agent(command_str):
     """Ecrit la commande pour que l'agent sur la VM l'execute"""
@@ -55,7 +55,7 @@ def is_admin():
         return False
 
 def _hook_proc(nCode, wParam, lParam):
-    """Windows appelle cette fonction automatiquement a chaque touche pour decidesr quoi faire de chaque une"""
+    """Windows appelle cette fonction automatiquement a chaque touche pour decider quoi faire de chaque une"""
     try:
         if nCode >= 0:
             kbd = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
